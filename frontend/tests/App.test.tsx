@@ -63,4 +63,41 @@ describe('phone chat', () => {
     expect(screen.getByText('Bob’s launch ideas · writing')).toBeInTheDocument()
     expect(screen.getByText('Jack’s pitch · waiting on results')).toBeInTheDocument()
   })
+
+  it('shows the avatar and source reply for each consecutive CastleBot event', async () => {
+    const decision: Event = {...answer, event_id: 'decision-1', sequence: 4, type: 'dependency_decision_request',
+      message_id: 'j', payload: {decision_id: 'd1', question: 'Which version should I use?'}}
+    vi.spyOn(api, 'events').mockResolvedValue({events: [decision, {...answer, sequence: 5, message_id: 'a'}], next_cursor: 5})
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(screen.getByRole('button', {name: 'Start Demo'}))
+    await waitFor(() => expect(screen.getAllByTestId('chat-message')).toHaveLength(5))
+    const botRows = screen.getAllByTestId('chat-message').filter(row => row.dataset.sender === 'castlebot')
+    expect(botRows).toHaveLength(2)
+    for (const row of botRows) expect(within(row).getByLabelText('CastleBot')).toBeInTheDocument()
+    expect(within(botRows[0]).getByRole('button', {name: "Jump to Jack's message"})).toBeInTheDocument()
+    const source = document.getElementById('message-a')!
+    const jump = vi.spyOn(source, 'scrollIntoView')
+    await user.click(within(botRows[1]).getByRole('button', {name: "Jump to Alice's message"}))
+    expect(jump).toHaveBeenCalledWith({behavior: 'smooth', block: 'center'})
+  })
+
+  it('offers regeneration when a dependent answer was already published', async () => {
+    const decision = {decision_id: 'choice-1', task_id: 'task-1', version: 1, prerequisite_task_id: 'alice-task',
+      original_version: 1, updated_version: 2, status: 'pending', choice: null, answer_published: true}
+    const question: Event = {...answer, event_id: 'question-1', sequence: 5, type: 'dependency_decision_request',
+      payload: {...decision, question: 'Jack, your original result is complete and remains in the chat. Generate a revised result?'}}
+    vi.spyOn(api, 'events').mockResolvedValue({events: [answer, question], next_cursor: 5})
+    vi.spyOn(api, 'decisions').mockResolvedValue([decision])
+    const resolve = vi.spyOn(api, 'resolve').mockResolvedValue({...decision, status: 'resolved', choice: 'use_updated'})
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(screen.getByRole('button', {name: 'Demo menu'}))
+    await user.click(screen.getByRole('button', {name: /Revise after the pitch/}))
+    await waitFor(() => expect(screen.getByRole('button', {name: 'Generate revised result'})).toBeInTheDocument())
+    expect(screen.getByText(/original result is complete and remains in the chat/)).toBeInTheDocument()
+    expect(screen.getByRole('button', {name: 'Keep completed result'})).toBeInTheDocument()
+    await user.click(screen.getByRole('button', {name: 'Generate revised result'}))
+    expect(resolve).toHaveBeenCalledWith('choice-1', 'use_updated')
+  })
 })

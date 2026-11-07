@@ -6,6 +6,7 @@ remains the configured OpenAI router/executor. This module never changes DB stat
 import asyncio
 
 from config import Settings
+from crud import Store
 from executor import Executor
 from router import Router
 from schemas import RouteDecision
@@ -85,14 +86,25 @@ class DemoRouter:
 
 
 class DemoExecutor:
-    def __init__(self, live: Executor, settings: Settings):
+    def __init__(self, live: Executor, settings: Settings, store: Store | None = None):
         self.live = live
         self.mock = MockExecutor()
         self.settings = settings
+        self.store = store
 
     async def execute(self, inputs: dict) -> str:
-        if inputs['chat_id'].startswith(PREFIX):
+        chat_id = inputs['chat_id']
+        if (self.store and chat_id.startswith(('demo-mock-before-', 'demo-live-before-'))
+                and inputs['version'] == 1 and inputs['prerequisites']
+                and '45-second pitch' in inputs['instructions'].lower()):
+            # Only the scripted first pitch waits. Its real run token is invalidated
+            # when the prerequisite revision creates a version decision.
+            while not await self.store.prerequisite_revised(chat_id, inputs['prerequisites']):
+                await asyncio.sleep(0.15)
+            if not await self.store.run_active((inputs['task_id'], inputs['version']), inputs['run_token']):
+                raise asyncio.CancelledError
+        if chat_id.startswith(PREFIX):
             return await self.mock.execute(inputs)
-        if inputs['chat_id'].startswith('demo-live-') and self.settings.demo_execution_delay_seconds:
+        if chat_id.startswith('demo-live-') and self.settings.demo_execution_delay_seconds:
             await asyncio.sleep(self.settings.demo_execution_delay_seconds)
         return await self.live.execute(inputs)

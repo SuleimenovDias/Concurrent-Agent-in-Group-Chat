@@ -65,6 +65,7 @@ class DecisionResponse(ORMResponse):
     updated_version: int
     status: str
     choice: str | None
+    answer_published: bool = False
 
 
 class VersionResponse(ORMResponse):

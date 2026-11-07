@@ -7,6 +7,7 @@ test('main StudyBuddy run uses backend decisions and publishes the final pitch',
   await page.getByRole('button', {name: 'Start Demo'}).click()
   await expect(page.getByText('Morning guys!', {exact: false})).toBeVisible()
   await expect(page.getByText('Use updated version', {exact: false}).first()).toBeVisible({timeout: 35_000})
+  expect(await page.getByText('Built from the selected findings:').count()).toBe(0)
   await page.getByRole('button', {name: 'Use updated version'}).first().click()
   await expect(page.getByText('Jack chose the updated feature suggestions.')).toBeVisible()
   await expect(page.getByText('Perfect. I’ll handle the slides.', {exact: false})).toBeVisible({timeout: 35_000}).catch(async () => {
@@ -16,8 +17,27 @@ test('main StudyBuddy run uses backend decisions and publishes the final pitch',
   await expect(page.getByText('Built from the selected findings:')).toBeVisible()
   await expect(page.getByText(/Three exam-season features/).first()).toBeVisible()
   await expect(page.getByTestId('chat-message').last()).toContainText("Perfect. I'll handle the slides.")
+  await expect.poll(() => page.locator('.conversation').evaluate(el =>
+    Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight))).toBeLessThan(22)
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await page.screenshot({path: 'screenshots/studybuddy-phone.png', fullPage: true})
+})
+
+test('after publication offers a second pitch and preserves the first', async ({page}) => {
+  test.setTimeout(90_000)
+  await page.goto('/')
+  await page.getByRole('button', {name: 'Demo menu'}).click()
+  await page.getByRole('button', {name: /Revise after the pitch/}).click()
+  await page.getByRole('button', {name: 'Demo menu'}).click()
+  await page.getByRole('button', {name: /Start Demo/}).last().click()
+  await expect(page.getByText('Nice, the first pitch is ready.')).toBeVisible({timeout: 35_000})
+  await expect(page.getByText('Built from the selected findings:')).toHaveCount(1)
+  await expect(page.getByRole('button', {name: 'Generate revised result'})).toBeVisible({timeout: 25_000})
+  await expect(page.getByText(/original result is complete and remains in the chat/)).toBeVisible()
+  await page.getByRole('button', {name: 'Generate revised result'}).click()
+  await expect(page.getByText('Jack requested a revised result.')).toBeVisible()
+  await expect(page.getByText('Now we have both versions to compare.')).toBeVisible({timeout: 35_000})
+  await expect(page.getByText('Built from the selected findings:')).toHaveCount(2)
 })
 
 test('cancellation reports the actual backend result', async ({page}) => {

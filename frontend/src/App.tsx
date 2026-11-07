@@ -23,6 +23,10 @@ function BotMarkdown({children}: {children: string}) {
   return <div className="bot-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown></div>
 }
 
+function DecisionButtons({published, busy, choose}: {published: boolean; busy: boolean; choose: (choice: 'keep_original' | 'use_updated') => void}) {
+  return <div className="decision-buttons"><button disabled={busy} onClick={() => choose('keep_original')}>{published ? 'Keep completed result' : 'Use original version'}</button><button disabled={busy} onClick={() => choose('use_updated')}>{published ? 'Generate revised result' : 'Use updated version'} <ArrowDown size={13}/></button></div>
+}
+
 function App() {
   const demo = useDemo()
   const {state} = demo
@@ -36,14 +40,17 @@ function App() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const [nearBottom, setNearBottom] = useState(true)
+  const userScroll = useRef(false)
 
   useEffect(() => { api.config().then(setConfig).catch(() => setConfig({mock_available: true, live_available: false, live_delay_seconds: 0})) }, [])
+  useEffect(() => { userScroll.current = false; setNearBottom(true) }, [state.chatId])
   useEffect(() => { if (nearBottom) endRef.current?.scrollIntoView({behavior: 'smooth', block: 'end'}) }, [messages, events, tasks, nearBottom])
   const latestDecisionEvents = useMemo(() => {
     const ids = new Map<string, number>()
     for (const event of events) if (event.type === 'dependency_decision_request') ids.set(String(event.payload.decision_id), event.sequence)
     return ids
   }, [events])
+  const messagesById = useMemo(() => new Map(messages.map(message => [message.message_id, message])), [messages])
   const timeline = useMemo<TimelineItem[]>(() => {
     const fromMessages: TimelineItem[] = messages.map(m => ({key: m.message_id, at: m.created_at, rank: m.sequence,
       sender: m.user_id as Participant, message: m}))
@@ -105,24 +112,31 @@ function App() {
           <p className="menu-note">Live mode calls your OpenAI account after you press Start Demo. Mock preview uses fixed examples.</p>
         </section></div>}
         <div className="chat-subheader"><span className={`mode-badge mode-badge--${state.mode}`}><span/>{state.mode === 'live' ? 'LIVE OPENAI' : 'MOCK PREVIEW'}</span><span>{state.chatId && !connected ? 'Connecting…' : scenario.title}<ChevronDown size={13}/></span></div>
-        <div className="conversation" ref={scrollRef} onScroll={e => {const el = e.currentTarget; setNearBottom(el.scrollHeight-el.scrollTop-el.clientHeight < 120)}}>
+        <div className="conversation" ref={scrollRef} onWheel={e => {const el = e.currentTarget; if (e.deltaY < 0 || el.scrollHeight-el.scrollTop-el.clientHeight >= 120) userScroll.current = true}} onTouchMove={() => {userScroll.current = true}} onScroll={e => {if (!userScroll.current) return; const el = e.currentTarget; const bottom = el.scrollHeight-el.scrollTop-el.clientHeight < 120; setNearBottom(bottom); if (bottom) userScroll.current = false}}>
           {!state.chatId && <div className="intro"><div className="intro-icon"><Sparkles size={28}/></div><div className="intro-rule"/><span className="intro-eyebrow">WELCOME TO THE GROUP</span><h2>Good ideas are<br/><em>better together.</em></h2><p>Watch three friends plan their big pitch with a little help from CastleBot.</p><div className="intro-members"><Avatar person="alice"/><Avatar person="bob"/><Avatar person="jack"/><Avatar person="castlebot"/></div><button className="start-button" onClick={() => void demo.start(true)}><Play size={17} fill="currentColor"/> Start Demo</button><span className="intro-hint">Select a scenario in the ••• menu</span></div>}
           {state.chatId && <><div className="date-divider"><span>Today</span></div><div className="scene-caption"><Sparkles size={12}/> {scenario.caption}</div>
             {timeline.map((item, index) => {
               const own = item.sender === sender
               const previous = timeline[index - 1]
-              const grouped = !!previous && previous.sender === item.sender && new Date(item.at).getTime() - new Date(previous.at).getTime() < 90_000
+              const grouped = item.sender !== 'castlebot' && !!previous && previous.sender === item.sender && new Date(item.at).getTime() - new Date(previous.at).getTime() < 90_000
               const name = names[item.sender] ?? item.sender
               const event = item.event
+              const source = event?.message_id ? messagesById.get(event.message_id) : undefined
               const decisionId = event?.type === 'dependency_decision_request' ? String(event.payload.decision_id) : null
               const pending = decisionId ? decisions.find(d => d.decision_id === decisionId) ?? (state.decision?.decision_id === decisionId ? state.decision : null) : null
-              return <div key={item.key} className={`message-row ${own ? 'message-row--own' : ''} ${grouped ? 'message-row--grouped' : ''}`} data-testid="chat-message" data-sender={item.sender}>
+              const published = decisionId ? pending?.answer_published ?? (typeof event?.payload.answer_published === 'boolean'
+                ? event.payload.answer_published : events.some(e => e.type === 'agent_answer' && e.task_id === event?.task_id && e.version === event?.version && e.sequence < event.sequence)) : false
+              const question = published && event?.payload.answer_published !== true
+                ? 'The original result is already complete and remains in the chat. Keep it or generate a revised result using the updated task?'
+                : String(event?.payload.question ?? 'Which version should I use?')
+              return <div key={item.key} id={item.message ? `message-${item.message.message_id}` : undefined} className={`message-row ${own ? 'message-row--own' : ''} ${grouped ? 'message-row--grouped' : ''}`} data-testid="chat-message" data-sender={item.sender}>
                 {!own && <div className="message-avatar">{!grouped && <Avatar person={item.sender}/>}</div>}
                 <div className={`bubble bubble--${item.sender}`}>
                   {!own && !grouped && <span className="sender-name">{name}</span>}
+                  {source && <button type="button" className="reply-preview" aria-label={`Jump to ${names[source.user_id as Participant] ?? source.user_id}'s message`} onClick={() => {userScroll.current = true; setNearBottom(false); document.getElementById(`message-${source.message_id}`)?.scrollIntoView({behavior: 'smooth', block: 'center'})}}><span className="reply-preview__sender">{names[source.user_id as Participant] ?? source.user_id}</span><span className="reply-preview__text">{source.content}</span></button>}
                   {item.message ? <p className="bubble-text">{item.message.content}</p> : event?.type === 'agent_answer' ? <BotMarkdown>{String(event.payload.content ?? '')}</BotMarkdown> :
-                   event?.type === 'dependency_decision_request' ? <><p className="bubble-text">{state.scenario === 'main' ? 'Alice updated her feature suggestions to focus on exam preparation. Jack, should I use her original suggestions or the updated version for your pitch?' : String(event.payload.question ?? 'Which version should I use?')}</p>
-                    {pending ? <div className="decision-buttons"><button disabled={state.busy} onClick={() => void demo.choose('keep_original')}>Use original version</button><button disabled={state.busy} onClick={() => void demo.choose('use_updated')}>Use updated version <ArrowDown size={13}/></button></div> : resolved.has(decisionId!) ? <span className="choice-note">{resolved.get(decisionId!) === 'use_updated' ? 'Updated version selected' : 'Original version selected'}</span> : null}</> :
+                   event?.type === 'dependency_decision_request' ? <><p className="bubble-text">{question}</p>
+                    {pending ? <DecisionButtons published={published} busy={state.busy || state.phase === 'playing'} choose={choice => void demo.choose(choice, pending)}/> : resolved.has(decisionId!) ? <span className="choice-note">{published ? resolved.get(decisionId!) === 'use_updated' ? 'Revised result requested' : 'Completed result kept' : resolved.get(decisionId!) === 'use_updated' ? 'Updated version selected' : 'Original version selected'}</span> : null}</> :
                    event?.type === 'clarification_request' ? <><p className="bubble-text">{String(event.payload.question ?? 'Which task did you mean?')}</p>{state.scenario === 'ambiguity' && <div className="decision-buttons"><button onClick={() => {setSender('alice'); setDraft('@CastleBot update my StudyBuddy tagline task to focus on exam season.')}}>Tagline</button><button onClick={() => {setSender('alice'); setDraft('@CastleBot update my pitch outline task to focus on exam season.')}}>Pitch outline</button></div>}</> :
                    <p className="bubble-text error-text">{String(event?.payload.error ?? 'CastleBot could not finish this request.')}</p>}
                   <div className="bubble-meta"><time>{time(item.at)}</time>{own && <CheckCheck size={13}/>}</div>
@@ -132,7 +146,7 @@ function App() {
             {activity && <div className="activity"><div className="activity-heading"><span className="activity-icon"><Sparkles size={14}/></span><span>{activity}</span>{running > 0 && <span className="typing-dots"><i/><i/><i/></span>}</div>{activeTasks.length > 0 && <div className="activity-tasks">{activeTasks.map(task => <span key={task.task_id}>{taskLabel(task)}</span>)}</div>}</div>}
             {state.notice && <div className="notice" role="status"><Check size={13}/>{state.notice}</div>}
             {(state.error || manualError || feedError) && <div className="error-notice" role="alert"><CircleHelp size={15}/><span>{state.error ?? manualError ?? feedError}</span><button aria-label="Dismiss error" onClick={() => setManualError(null)}><X size={13}/></button></div>}
-            {state.phase === 'decision' && !events.some(e => e.type === 'dependency_decision_request' && e.payload.decision_id === state.decision?.decision_id) && <div className="decision-pending"><Avatar person="castlebot"/><div><p>Alice updated her feature suggestions. Jack, which version should I use?</p><div className="decision-buttons"><button onClick={() => void demo.choose('keep_original')}>Use original version</button><button onClick={() => void demo.choose('use_updated')}>Use updated version</button></div></div></div>}
+            {state.phase === 'decision' && !events.some(e => e.type === 'dependency_decision_request' && e.payload.decision_id === state.decision?.decision_id) && <div className="decision-pending"><Avatar person="castlebot"/><div><p>{state.decision?.answer_published ? 'The original result is complete and remains in the chat. Keep it or generate a revised result?' : 'Alice updated her feature suggestions. Jack, which version should I use?'}</p><DecisionButtons published={Boolean(state.decision?.answer_published)} busy={state.busy} choose={choice => void demo.choose(choice)}/></div></div>}
             {state.phase === 'done' && <div className="end-caption">You’re all caught up <Sparkles size={13}/></div>}
             <div ref={endRef}/></>}
         </div>

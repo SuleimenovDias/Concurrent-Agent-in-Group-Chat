@@ -173,6 +173,8 @@ async def test_dependency_decisions(store, choice):
     old_inputs = await store.claim(a)
     a2 = await revise(store, a[0], 'A2')
     d = (await store.task(*c)).pending_decisions[0]
+    assert d.answer_published is False
+    assert (await store.task(*c)).status == 'waiting_for_decision'
     with pytest.raises(DomainError, match='owner'):
         await store.decide(d.decision_id, 'alice', choice)
     await store.decide(d.decision_id, 'jack', choice)
@@ -197,6 +199,8 @@ async def test_running_dependent_paused_and_run_token_rejects_late_completion(st
     old = await store.claim(c)
     await revise(store, a[0])
     d = (await store.task(*c)).pending_decisions[0]
+    assert d.answer_published is False
+    assert (await store.task(*c)).status == 'waiting_for_decision'
     assert not await store.finish(c, old['run_token'], result='stale C')
     await store.decide(d.decision_id, 'jack', 'keep_original')
     current = await store.claim(c)
@@ -212,14 +216,61 @@ async def test_completed_dependent_updated_preserves_published_history(store):
     await complete(store, c, 'old comparison')
     completed_at = (await store.task(*c)).completed_at
     a2 = await revise(store, a[0])
-    d = (await store.task(*c)).pending_decisions[0]
+    pending = await store.task(*c)
+    assert pending.status == 'completed' and pending.result == 'old comparison'
+    assert pending.completed_at == completed_at
+    d = pending.pending_decisions[0]
+    assert d.answer_published is True
+    question = next(e for e in (await store.events('chat', 0, 200)).events
+                    if e.type == 'dependency_decision_request')
+    assert question.payload['answer_published'] is True
+    assert 'complete and remains in the chat' in question.payload['question']
     await store.decide(d.decision_id, 'jack', 'use_updated')
     assert (await store.task(*c)).status == 'completed'
     assert (await store.task(*c)).completed_at == completed_at
+    assert (await store.task(c[0])).version == 2
+    assert (await store.task(c[0])).status == 'waiting_for_dependencies'
     await complete(store, a2, 'updated')
     await complete(store, (c[0], 2), 'updated comparison')
     answers = [e.payload['content'] for e in (await store.events('chat', 0, 200)).events if e.type == 'agent_answer']
     assert 'old comparison' in answers and 'updated comparison' in answers
+
+
+async def test_completed_dependent_keep_original_is_noop_for_published_result(store):
+    a = await new_task(store)
+    await complete(store, a, 'first findings')
+    c = await new_task(store, user='jack', refs=[a[0]])
+    await complete(store, c, 'published pitch')
+    original = await store.task(*c)
+    await revise(store, a[0])
+    decision = (await store.task(*c)).pending_decisions[0]
+    assert decision.answer_published is True
+    resolved = await store.decide(decision.decision_id, 'jack', 'keep_original')
+    assert resolved.answer_published is True
+    current = await store.task(c[0])
+    assert current.version == 1 and current.status == 'completed'
+    assert current.result == original.result and current.completed_at == original.completed_at
+    answers = [e for e in (await store.events('chat', 0, 200)).events
+               if e.type == 'agent_answer' and e.task_id == c[0]]
+    assert len(answers) == 1 and answers[0].payload['content'] == 'published pitch'
+
+
+async def test_recovery_repairs_legacy_published_decision_status(store):
+    a = await new_task(store)
+    await complete(store, a)
+    c = await new_task(store, user='jack', refs=[a[0]])
+    await complete(store, c, 'already published')
+    await revise(store, a[0])
+    original = await store.task(*c)
+    async with store.transaction() as s:
+        version = await s.get(TaskVersion, c)
+        await store._status(s, version, 'waiting_for_decision')
+    assert (await store.task(*c)).status == 'waiting_for_decision'
+    await store.recover()
+    repaired = await store.task(*c)
+    assert repaired.status == 'completed' and repaired.result == 'already published'
+    assert repaired.completed_at == original.completed_at
+    assert repaired.pending_decisions[0].answer_published is True
 
 
 async def test_two_concurrent_revisions_and_pending_offer_coalescing(store):
@@ -313,7 +364,8 @@ async def test_retention_dry_run_and_protection(store):
     a = await new_task(store)
     await complete(store, a)
     b = await new_task(store, user='bob')
-    await complete(store, b)
+    failed = await store.claim(b)
+    assert await store.finish(b, failed['run_token'], error='not available')
     c = await new_task(store, user='jack', refs=[a[0]])
     await revise(store, a[0])
     await revise(store, b[0], user='bob')
@@ -321,13 +373,31 @@ async def test_retention_dry_run_and_protection(store):
         for key in [a, b]:
             (await s.get(TaskVersion, key)).completed_at = utcnow() - timedelta(days=40)
     assert await store.cleanup() == [b]
-    assert (await store.task(*b)).status == 'completed'
+    assert (await store.task(*b)).status == 'failed'
     assert await store.cleanup(dry_run=False) == [b]
     with pytest.raises(DomainError, match='Version'):
         await store.task(*b)
     assert (await store.task(*a)).status == 'completed'
     assert (await store.task(*c)).pending_decisions
     assert (await store.task(b[0])).version == 2
+
+
+async def test_retention_keeps_published_historical_answer(store):
+    a = await new_task(store)
+    await complete(store, a)
+    c = await new_task(store, user='jack', refs=[a[0]])
+    await complete(store, c, 'published first answer')
+    a2 = await revise(store, a[0])
+    decision = (await store.task(*c)).pending_decisions[0]
+    await store.decide(decision.decision_id, 'jack', 'use_updated')
+    await complete(store, a2)
+    await complete(store, (c[0], 2), 'published second answer')
+    async with store.transaction() as s:
+        (await s.get(TaskVersion, c)).completed_at = utcnow() - timedelta(days=40)
+    assert c not in await store.cleanup()
+    await store.cleanup(dry_run=False)
+    old = await store.task(*c)
+    assert old.status == 'completed' and old.result == 'published first answer'
 
 
 async def test_ordinary_execution_failure_and_timeout(store, schedulers):

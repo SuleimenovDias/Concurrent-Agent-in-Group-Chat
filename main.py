@@ -26,7 +26,7 @@ def create_app(settings: Settings | None = None, sessions=None, db_engine=None, 
     gateway = OpenAIGateway(settings)
     store = Store(sessions, settings)
     scheduler = Scheduler(store, router or DemoRouter(OpenAIRouter(gateway, settings)),
-                          executor or DemoExecutor(OpenAIExecutor(gateway, settings), settings), settings)
+                          executor or DemoExecutor(OpenAIExecutor(gateway, settings), settings, store), settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -116,9 +116,10 @@ def create_app(settings: Settings | None = None, sessions=None, db_engine=None, 
     @app.get('/chats/{chat_id}/decisions', response_model=list[DecisionResponse])
     async def decisions(chat_id: str):
         async with sessions() as s:
-            return list((await s.scalars(select(DependencyDecision).join(TaskRecord, TaskRecord.task_id == DependencyDecision.task_id)
+            rows = list((await s.scalars(select(DependencyDecision).join(TaskRecord, TaskRecord.task_id == DependencyDecision.task_id)
                 .where(TaskRecord.chat_id == chat_id, DependencyDecision.status == 'pending')
                 .order_by(DependencyDecision.created_at).limit(200))).all())
+            return [await store.decision_response(s, d) for d in rows]
 
     @app.post('/tasks/{task_id}/cancel', response_model=TaskResponse)
     async def cancel(task_id: str):

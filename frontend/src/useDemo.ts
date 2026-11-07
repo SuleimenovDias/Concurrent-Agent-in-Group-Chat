@@ -45,22 +45,26 @@ export function useDemo() {
       }
     }
     if (!active(epoch)) return
-    const chatId = `demo-${mode}-${crypto.randomUUID()}`
+    const timing = scenario === 'main' ? 'before-' : scenario === 'revision_after' ? 'after-' : ''
+    const chatId = `demo-${mode}-${timing}${crypto.randomUUID()}`
     set({chatId, scenario, mode, phase: autoplay ? 'playing' : 'paused', step: 0, busy: false,
       decision: null, error: null, notice: null, refs: {}})
   }, [set])
-  const choose = useCallback(async (choice: 'keep_original' | 'use_updated') => {
+  const choose = useCallback(async (choice: 'keep_original' | 'use_updated', offered?: Decision) => {
     const snapshot = current.current
-    if (!snapshot.decision || !snapshot.chatId || lock.current) return
+    const decision = snapshot.decision ?? offered
+    if (!decision || !snapshot.chatId || lock.current) return
     const epoch = generation.current
     lock.current = true
     set({busy: true, error: null})
     try {
-      const result = await api.resolve(snapshot.decision.decision_id, choice)
+      const result = await api.resolve(decision.decision_id, choice)
       if (!active(epoch)) return
       if (result.status !== 'resolved') throw new Error('The decision was not accepted.')
-      set({decision: null, phase: 'playing', step: snapshot.step, busy: false,
-        notice: choice === 'use_updated' ? 'Jack chose the updated feature suggestions.' : 'Jack kept the original feature suggestions.'})
+      set({decision: null, phase: snapshot.phase === 'decision' ? 'playing' : snapshot.phase, step: snapshot.step, busy: false,
+        notice: decision.answer_published
+          ? choice === 'use_updated' ? 'Jack requested a revised result.' : 'Jack kept the completed result.'
+          : choice === 'use_updated' ? 'Jack chose the updated feature suggestions.' : 'Jack kept the original feature suggestions.'})
     } catch (error) {
       if (active(epoch)) set({busy: false, error: error instanceof Error ? error.message : 'Could not save choice'})
     } finally { lock.current = false }
@@ -103,14 +107,27 @@ export function useDemo() {
       return
     }
     if (step.kind === 'await-decision') {
+      const prior = await api.events(chatId, 0)
+      if (prior.events.some(e => e.type === 'task_status' && e.task_id === refs.jack &&
+          typeof e.payload.decision_id === 'string')) return
       const decisions = await until(epoch, () => api.decisions(chatId), ds => ds.some(d => d.task_id === refs.jack), 'Jack’s version choice')
       const decision = decisions.find(d => d.task_id === refs.jack)!
       set({decision, phase: 'decision', notice: null})
       return
     }
+    if (step.kind === 'await-answer') {
+      const taskId = refs[step.ref]
+      if (!taskId) throw new Error('The pitch task was not created.')
+      await until(epoch, () => api.events(chatId, 0), page => page.events.some(e =>
+        e.type === 'agent_answer' && e.task_id === taskId && e.version === 1), 'Jack’s first published answer')
+      return
+    }
     if (step.kind === 'await-pitch') {
-      const pitch = await until<Task>(epoch, () => api.task(refs.jack!),
-        t => ['completed','failed','cancelled'].includes(t.status), 'Jack’s completed pitch')
+      const outcome = await until(epoch, async () => ({pitch: await api.task(refs.jack!), page: await api.events(chatId, 0)}),
+        ({pitch, page}) => ['failed','cancelled'].includes(pitch.status) ||
+          (pitch.status === 'completed' && page.events.some(e => e.type === 'agent_answer' && e.task_id === pitch.task_id && e.version === pitch.version)),
+        'Jack’s published pitch')
+      const pitch: Task = outcome.pitch
       if (pitch.status !== 'completed') throw new Error(`Jack’s pitch ${pitch.status}: ${pitch.error ?? 'inspect task status'}`)
       return
     }

@@ -90,6 +90,15 @@ class Store:
             DependencyDecision.task_id == key[0], DependencyDecision.version == key[1],
             DependencyDecision.status == 'pending'))).all())
 
+    async def _answer_published(self, s: AsyncSession, key: Key) -> bool:
+        return await s.scalar(select(ChatEvent.event_id).where(
+            ChatEvent.task_id == key[0], ChatEvent.version == key[1],
+            ChatEvent.type == 'agent_answer').limit(1)) is not None
+
+    async def decision_response(self, s: AsyncSession, d: DependencyDecision) -> DecisionResponse:
+        return DecisionResponse.model_validate(d).model_copy(update={
+            'answer_published': await self._answer_published(s, (d.task_id, d.version))})
+
     async def _validate_edges(self, s: AsyncSession, task: TaskRecord, refs: list[Key]) -> None:
         if len({key[0] for key in refs}) != len(refs):
             raise DomainError('Duplicate prerequisites', 422)
@@ -128,9 +137,18 @@ class Store:
             edges.setdefault((e.task_id, e.version), []).append((e.prerequisite_task_id, e.prerequisite_version))
         decisions = list((await s.scalars(select(DependencyDecision).where(DependencyDecision.status == 'pending'))).all())
         pending = {(d.task_id, d.version) for d in decisions}
+        possible_published = {key for key, v in versions.items() if v.status in ACTIVE and v.result is not None}
+        published = set()
+        if possible_published:
+            published = {(task_id, version) for task_id, version in (await s.execute(
+                select(ChatEvent.task_id, ChatEvent.version).where(
+                    ChatEvent.type == 'agent_answer',
+                    ChatEvent.task_id.in_({key[0] for key in possible_published})))).all()
+                if (task_id, version) in possible_published}
         needed = {k for k, v in versions.items() if tasks[k[0]].version == k[1] and v.status in ACTIVE}
         for d in decisions:
-            needed.update({(d.prerequisite_task_id, d.original_version), (d.prerequisite_task_id, d.updated_version)})
+            needed.update({(d.task_id, d.version), (d.prerequisite_task_id, d.original_version),
+                           (d.prerequisite_task_id, d.updated_version)})
         todo = list(needed)
         while todo:
             for parent in edges.get(todo.pop(), []):
@@ -145,9 +163,10 @@ class Store:
                 if v.status not in ACTIVE:
                     continue
                 old_status = v.status
-                if key not in pending and v.result is not None:
-                    # A completed answer paused for a decision remains a
-                    # completed historical snapshot after the dependent revises.
+                if key in published and v.result is not None:
+                    # Repair decisions created by older code without changing the published answer.
+                    await self._status(s, v, 'completed')
+                elif key not in pending and v.result is not None:
                     await self._status(s, v, 'completed')
                 elif tasks[key[0]].version != key[1] and key not in needed:
                     await self._status(s, v, 'cancelled', 'Superseded and no longer required')
@@ -180,6 +199,21 @@ class Store:
         async with self.sessions() as s:
             return list((await s.scalars(select(ChatMessage.chat_id).where(
                 ChatMessage.routing_status == 'pending').distinct())).all())
+
+    async def prerequisite_revised(self, chat_id: str, parents: list[dict]) -> bool:
+        """Read-only gate for the scripted before-publication demo."""
+        if not parents:
+            return False
+        async with self.sessions() as s:
+            current = dict((await s.execute(select(TaskRecord.task_id, TaskRecord.version).where(
+                TaskRecord.chat_id == chat_id,
+                TaskRecord.task_id.in_([parent['task_id'] for parent in parents])))).all())
+        return any(current.get(parent['task_id'], parent['version']) > parent['version'] for parent in parents)
+
+    async def run_active(self, key: Key, token: str) -> bool:
+        async with self.sessions() as s:
+            version = await s.get(TaskVersion, key)
+            return bool(version and version.status == 'running' and version.run_token == token)
 
     async def claim_message(self, chat_id: str) -> ChatMessage | None:
         async with self.transaction() as s:
@@ -276,9 +310,14 @@ class Store:
         owner = await s.get(TaskRecord, d.task_id)
         parent = await s.get(TaskRecord, d.prerequisite_task_id)
         v = await s.get(TaskVersion, (d.task_id, d.version))
+        response = await self.decision_response(s, d)
+        question = (f'{owner.user_id.capitalize()}, your original result is complete and remains in the chat. '
+                    f'{parent.user_id.capitalize()} updated their task. Keep the completed result or generate '
+                    'a revised result using the update?') if response.answer_published else (
+                    f'{parent.user_id.capitalize()} updated their task. {owner.user_id.capitalize()}, '
+                    'should I continue with the original version or use the updated version?')
         await self._event(s, owner.chat_id, 'dependency_decision_request',
-            {**DecisionResponse.model_validate(d).model_dump(), 'user_id': owner.user_id,
-             'question': f'{parent.user_id} updated their task. Would you like to use the original version or the updated version?'}, v)
+            {**response.model_dump(), 'user_id': owner.user_id, 'question': question}, v)
 
     async def _notify_revision(self, s: AsyncSession, task: TaskRecord, new: TaskVersion) -> None:
         affected = (await s.execute(select(TaskDependency, TaskRecord, TaskVersion)
@@ -299,7 +338,8 @@ class Store:
                     updated_version=new.version, status='pending')
                 s.add(d)
             await s.flush()
-            await self._status(s, v, 'waiting_for_decision')
+            if not await self._answer_published(s, (v.task_id, v.version)):
+                await self._status(s, v, 'waiting_for_decision')
             await self._decision_event(s, d)
 
     async def decide(self, decision_id: str, user_id: str, choice: str) -> DecisionResponse:
@@ -314,7 +354,7 @@ class Store:
                 raise DomainError('Invalid choice', 422)
             if d.status != 'pending':
                 if d.status == 'resolved' and d.choice == choice:
-                    return DecisionResponse.model_validate(d)
+                    return await self.decision_response(s, d)
                 raise DomainError('Decision is no longer pending')
             if task.version != d.version:
                 raise DomainError('Decision does not match the current task version')
@@ -327,7 +367,7 @@ class Store:
             await self._event(s, task.chat_id, 'task_status',
                               {'decision_id': d.decision_id, 'choice': choice, 'current_version': task.version},
                               await s.get(TaskVersion, (task.task_id, task.version)))
-            return DecisionResponse.model_validate(d)
+            return await self.decision_response(s, d)
 
     async def cancel(self, task_id: str) -> TaskResponse:
         async with self.transaction() as s:
@@ -381,7 +421,8 @@ class Store:
                 query = query.where(ChatMessage.sequence <= origin.sequence)
             history = list((await s.scalars(query.order_by(ChatMessage.sequence.desc())
                                            .limit(self.settings.context_messages))).all())
-            return {'run_token': token, 'chat_id': t.chat_id, 'instructions': v.content, 'prerequisites': parents,
+            return {'run_token': token, 'task_id': v.task_id, 'version': v.version,
+                    'chat_id': t.chat_id, 'instructions': v.content, 'prerequisites': parents,
                     'conversation': [{'user_id': m.user_id, 'content': m.content[:2000]} for m in reversed(history)]}
 
     async def finish(self, key: Key, token: str, result: str | None = None, error: str | None = None) -> bool:
@@ -419,7 +460,7 @@ class Store:
             return TaskResponse(**VersionResponse.model_validate(v).model_dump(), chat_id=t.chat_id,
                 user_id=t.user_id, original_message_id=t.message_id,
                 dependencies=[DependencyResponse.model_validate(e) for e in await self._edges(s, (task_id, v.version))],
-                pending_decisions=[DecisionResponse.model_validate(d) for d in await self._pending(s, (task_id, v.version))])
+                pending_decisions=[await self.decision_response(s, d) for d in await self._pending(s, (task_id, v.version))])
 
     async def events(self, chat_id: str, after: int, limit: int) -> EventPage:
         async with self.sessions() as s:
@@ -435,6 +476,8 @@ class Store:
             tasks = {t.task_id: t.version for t in (await s.scalars(select(TaskRecord))).all()}
             edges = list((await s.scalars(select(TaskDependency))).all())
             decisions = list((await s.scalars(select(DependencyDecision))).all())
+            published = {(task_id, version) for task_id, version in (await s.execute(
+                select(ChatEvent.task_id, ChatEvent.version).where(ChatEvent.type == 'agent_answer'))).all()}
             protected = {(e.prerequisite_task_id, e.prerequisite_version) for e in edges}
             for d in decisions:
                 if d.status == 'pending':
@@ -443,7 +486,8 @@ class Store:
             candidates = list((await s.scalars(select(TaskVersion).where(
                 TaskVersion.status.in_(['completed', 'failed', 'cancelled']), TaskVersion.completed_at < cutoff))).all())
             keys = [(v.task_id, v.version) for v in candidates
-                    if tasks[v.task_id] != v.version and (v.task_id, v.version) not in protected]
+                    if tasks[v.task_id] != v.version and (v.task_id, v.version) not in protected
+                    and (v.task_id, v.version) not in published]
             if not dry_run:
                 for key in keys:
                     # Resolved decision audit survives in chat_events; remove its FK record if expiring.

@@ -125,5 +125,5 @@ class OpenAIExecutor:
 
     async def execute(self, inputs: dict) -> str:
         return await self.gateway.generate(model=self.settings.executor_model, system=EXECUTION_SYSTEM,
-            data={k: v for k, v in inputs.items() if k != 'run_token'}, max_tokens=self.settings.max_output_tokens,
+            data={k: v for k, v in inputs.items() if k not in {'run_token', 'task_id', 'version'}}, max_tokens=self.settings.max_output_tokens,
             reasoning_effort=self.settings.executor_reasoning_effort)

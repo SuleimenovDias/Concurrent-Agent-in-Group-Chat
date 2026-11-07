@@ -1,6 +1,6 @@
 export type Participant = 'alice' | 'bob' | 'jack'
 export type DemoMode = 'mock' | 'live'
-export type Scenario = 'main' | 'cancellation' | 'ambiguity'
+export type Scenario = 'main' | 'revision_after' | 'cancellation' | 'ambiguity'
 
 export interface Message {
   message_id: string; chat_id: string; user_id: string; content: string
@@ -15,6 +15,7 @@ export interface Task {
 export interface Decision {
   decision_id: string; task_id: string; version: number; prerequisite_task_id: string
   original_version: number; updated_version: number; status: string; choice: string | null
+  answer_published: boolean
 }
 export interface Event {
   event_id: string; chat_id: string; sequence: number; type: string; bot_id: string
